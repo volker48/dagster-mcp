@@ -95,7 +95,7 @@ uv sync
 | `DAGSTER_URL` | Base URL of your Dagster instance | `http://localhost:3000` |
 | `DAGSTER_API_TOKEN` | Dagster Cloud API token (leave empty for self-hosted) | _(empty)_ |
 | `DAGSTER_EXTRA_HEADERS` | JSON object of additional request headers sent to Dagster GraphQL | _(empty)_ |
-| `DAGSTER_READ_ONLY` | When `true`, only read tools are exposed (no launch/terminate/reload, no schedule or sensor start/stop) | `true` |
+| `DAGSTER_READ_ONLY` | When `true`, only read tools are exposed (no launch/terminate/reload, no schedule or sensor start/stop). Accepts `true`/`1`/`yes` or `false`/`0`/`no`; any other value, including an empty one, stops the server at startup | `true` |
 
 **Self-hosted:**
 
@@ -135,6 +135,8 @@ export DAGSTER_DEFAULT_ENV=prod
 ```
 
 When `DAGSTER_ENVS` is set, `DAGSTER_URL` / `DAGSTER_API_TOKEN` / `DAGSTER_EXTRA_HEADERS` are ignored. If only one env is defined, it is used automatically even without `DAGSTER_DEFAULT_ENV`.
+
+Each env must set a non-empty `url`. `token` and `extra_headers` (a JSON-encoded string, like `DAGSTER_EXTRA_HEADERS`) are optional but must be strings when present; `null` is rejected at startup rather than treated as "no credentials".
 
 ### Add to your MCP client
 

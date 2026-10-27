@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from dagster_mcp import server
 from dagster_mcp.server import gql
 
 
@@ -25,6 +26,26 @@ class TestGql:
         )
         with pytest.raises(RuntimeError, match="timed out after 30s"):
             gql("query { }")
+
+    @pytest.mark.parametrize(
+        ("error", "message"),
+        [
+            (httpx.ConnectError("refused"), "Cannot connect to Dagster at https://dagster.internal:8443/prod."),
+            (httpx.TimeoutException("timed out"), "Dagster at https://dagster.internal:8443/prod timed out"),
+        ],
+    )
+    def test_connection_errors_omit_url_secrets(self, monkeypatch, error, message):
+        monkeypatch.setattr(
+            server, "DAGSTER_URL", "https://svc:s3cret@dagster.internal:8443/prod?key=k3y#frag"
+        )
+        monkeypatch.setattr(httpx, "post", MagicMock(side_effect=error))
+        with pytest.raises(RuntimeError) as exc:
+            gql("query { }")
+        text = str(exc.value)
+        assert message in text
+        assert "s3cret" not in text
+        assert "svc" not in text
+        assert "k3y" not in text
 
     def test_http_error(self, mock_gql):
         mock_gql({"error": "Internal Server Error"}, status_code=500)

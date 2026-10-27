@@ -4,8 +4,9 @@ import bisect
 import json
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Final, TypedDict
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from fastmcp import FastMCP
@@ -19,14 +20,40 @@ from dagster_mcp.asset_selection import (
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://localhost:3000")
 DAGSTER_API_TOKEN = os.environ.get("DAGSTER_API_TOKEN", "")
 DAGSTER_EXTRA_HEADERS = os.environ.get("DAGSTER_EXTRA_HEADERS", "")
-READ_ONLY = os.environ.get("DAGSTER_READ_ONLY", "true").lower() in ("true", "1", "yes")
+_READ_ONLY_VALUES = {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
+
+
+def _parse_read_only(raw: str | None) -> bool:
+    """Parse DAGSTER_READ_ONLY, defaulting to read-only when unset.
+
+    Unrecognised values raise rather than fall through to read-write, so a typo
+    or an empty value can never expose the write tools.
+    """
+    if raw is None:
+        return True
+    try:
+        return _READ_ONLY_VALUES[raw.strip().lower()]
+    except KeyError:
+        raise RuntimeError(
+            f"DAGSTER_READ_ONLY must be one of {', '.join(_READ_ONLY_VALUES)}; got {raw!r}."
+        ) from None
+
+
+READ_ONLY = _parse_read_only(os.environ.get("DAGSTER_READ_ONLY"))
 
 # Multi-env support
 _DAGSTER_ENVS_RAW = os.environ.get("DAGSTER_ENVS", "")
 _DAGSTER_DEFAULT_ENV = os.environ.get("DAGSTER_DEFAULT_ENV", "")
 
 
-def _parse_dagster_envs(raw: str) -> dict[str, dict]:
+@dataclass(frozen=True)
+class _EnvConfig:
+    url: str
+    token: str = ""
+    extra_headers: str = ""
+
+
+def _parse_dagster_envs(raw: str) -> dict[str, _EnvConfig]:
     if not raw:
         return {}
     try:
@@ -39,10 +66,28 @@ def _parse_dagster_envs(raw: str) -> dict[str, dict]:
         ) from exc
     if not isinstance(envs, dict):
         raise RuntimeError("DAGSTER_ENVS must be a JSON object mapping env names to configs.")
-    return envs
+
+    parsed: dict[str, _EnvConfig] = {}
+    for name, cfg in envs.items():
+        if not isinstance(cfg, dict):
+            raise RuntimeError(f"DAGSTER_ENVS[{name!r}] must be a JSON object.")
+        # Each env is self-contained: a missing url or a null credential must not
+        # silently pick up a default, or one env's credentials reach another host.
+        url = cfg.get("url")
+        if not isinstance(url, str) or not url:
+            raise RuntimeError(f"DAGSTER_ENVS[{name!r}].url must be a non-empty string.")
+        for key in ("token", "extra_headers"):
+            if key in cfg and not isinstance(cfg[key], str):
+                raise RuntimeError(f"DAGSTER_ENVS[{name!r}].{key} must be a string when set.")
+        parsed[name] = _EnvConfig(
+            url=url,
+            token=cfg.get("token", ""),
+            extra_headers=cfg.get("extra_headers", ""),
+        )
+    return parsed
 
 
-_ENVS: dict[str, dict] = _parse_dagster_envs(_DAGSTER_ENVS_RAW)
+_ENVS: dict[str, _EnvConfig] = _parse_dagster_envs(_DAGSTER_ENVS_RAW)
 
 _mode = "read-only" if READ_ONLY else "read-write"
 _env_info = (
@@ -87,21 +132,10 @@ def _resolve_connection(env: str | None) -> tuple[str, str, str]:
         raise RuntimeError(f"Unknown Dagster env '{name}'. Available: {', '.join(_ENVS)}.")
 
     cfg = _ENVS[name]
-    url = cfg.get("url", "http://localhost:3000")
-    token = cfg.get("token", "")
-    extra = cfg.get("extra_headers", "")
-    return f"{url.rstrip('/')}/graphql", token, extra
+    return f"{cfg.url.rstrip('/')}/graphql", cfg.token, cfg.extra_headers
 
 
-def _build_headers(
-    api_token: str | None = None,
-    extra_headers_json: str | None = None,
-) -> dict[str, str]:
-    if api_token is None:
-        api_token = DAGSTER_API_TOKEN
-    if extra_headers_json is None:
-        extra_headers_json = DAGSTER_EXTRA_HEADERS
-
+def _build_headers(api_token: str, extra_headers_json: str) -> dict[str, str]:
     headers: dict[str, str] = {}
     if api_token:
         headers["Dagster-Cloud-Api-Token"] = api_token
@@ -253,6 +287,13 @@ def _dagster_19_compatibility_error(
     }
 
 
+def _display_url(url: str) -> str:
+    """Return url without userinfo, query, or fragment, any of which may hold secrets."""
+    parsed = urlparse(url)
+    host = parsed.netloc.rpartition("@")[2]
+    return urlunparse(parsed._replace(netloc=host, query="", fragment=""))
+
+
 def gql(query: str, variables: dict | None = None, env: str | None = None) -> dict:
     graphql_url, api_token, extra_headers_json = _resolve_connection(env)
     headers = _build_headers(api_token, extra_headers_json)
@@ -264,13 +305,13 @@ def gql(query: str, variables: dict | None = None, env: str | None = None) -> di
             timeout=30,
         )
     except httpx.ConnectError as exc:
-        base_url = graphql_url.removesuffix("/graphql")
+        base_url = _display_url(graphql_url.removesuffix("/graphql"))
         raise RuntimeError(
             f"Cannot connect to Dagster at {base_url}. "
             "Check that DAGSTER_URL is correct and the instance is running."
         ) from exc
     except httpx.TimeoutException as exc:
-        base_url = graphql_url.removesuffix("/graphql")
+        base_url = _display_url(graphql_url.removesuffix("/graphql"))
         raise RuntimeError(
             f"Request to Dagster at {base_url} timed out after 30s."
         ) from exc

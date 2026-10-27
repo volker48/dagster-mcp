@@ -1463,6 +1463,24 @@ class TestStopWhenAlreadyStopped:
         assert "stopped" in result["message"]
 
 
+class TestParseReadOnly:
+    def test_unset_defaults_to_read_only(self):
+        assert server_module._parse_read_only(None) is True
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", " true ", "Yes\n"])
+    def test_true_values(self, raw):
+        assert server_module._parse_read_only(raw) is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "0", "no", " false "])
+    def test_false_values(self, raw):
+        assert server_module._parse_read_only(raw) is False
+
+    @pytest.mark.parametrize("raw", ["", " ", "ture", "on", "off", "flase", "none"])
+    def test_unrecognised_values_raise(self, raw):
+        with pytest.raises(RuntimeError, match="DAGSTER_READ_ONLY must be one of"):
+            server_module._parse_read_only(raw)
+
+
 class TestReadOnlyGating:
     def test_write_tools_not_registered_in_readonly(self):
         import asyncio
@@ -1508,3 +1526,18 @@ print("\\n".join(sorted(tool.name for tool in asyncio.run(mcp.list_tools()))))
         assert "stop_schedule" in tool_names
         assert "start_sensor" in tool_names
         assert "stop_sensor" in tool_names
+
+    def test_malformed_read_only_fails_at_startup(self):
+        env = os.environ.copy()
+        env["DAGSTER_READ_ONLY"] = "ture"
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import dagster_mcp.server"],
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0
+        assert "DAGSTER_READ_ONLY must be one of" in result.stderr

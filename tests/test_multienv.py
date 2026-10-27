@@ -27,8 +27,10 @@ class TestParseEnvs:
     def test_valid_json_parsed(self):
         from dagster_mcp.server import _parse_dagster_envs
         result = _parse_dagster_envs(_TWO_ENVS)
-        assert "prod" in result
-        assert result["prod"]["url"] == "https://prod.dagster.io"
+        assert result == {
+            "prod": server._EnvConfig(url="https://prod.dagster.io", token="prod-token"),
+            "dev": server._EnvConfig(url="http://dev.dagster.io:3000"),
+        }
 
     def test_invalid_json_raises(self):
         from dagster_mcp.server import _parse_dagster_envs
@@ -39,6 +41,27 @@ class TestParseEnvs:
         from dagster_mcp.server import _parse_dagster_envs
         with pytest.raises(RuntimeError, match="JSON object"):
             _parse_dagster_envs('["prod", "dev"]')
+
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            ('"https://prod.dagster.io"', r"DAGSTER_ENVS\['prod'\] must be a JSON object"),
+            ('{"token": "prod-token"}', r"\.url must be a non-empty string"),
+            ('{"url": ""}', r"\.url must be a non-empty string"),
+            ('{"url": null}', r"\.url must be a non-empty string"),
+            ('{"url": "https://p", "token": null}', r"\.token must be a string"),
+            ('{"url": "https://p", "token": 123}', r"\.token must be a string"),
+            ('{"url": "https://p", "extra_headers": null}', r"\.extra_headers must be a string"),
+            (
+                '{"url": "https://p", "extra_headers": {"X-A": "b"}}',
+                r"\.extra_headers must be a string",
+            ),
+        ],
+    )
+    def test_invalid_env_config_raises(self, config, message):
+        from dagster_mcp.server import _parse_dagster_envs
+        with pytest.raises(RuntimeError, match=message):
+            _parse_dagster_envs(f'{{"prod": {config}}}')
 
 
 class TestResolveConnection:
@@ -53,40 +76,40 @@ class TestResolveConnection:
         assert extra == ""
 
     def test_multi_env_resolves_named_env(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         monkeypatch.setattr(server, "_DAGSTER_DEFAULT_ENV", "")
         url, token, extra = server._resolve_connection("prod")
         assert url == "https://prod.dagster.io/graphql"
         assert token == "prod-token"
 
     def test_multi_env_uses_default_env(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         monkeypatch.setattr(server, "_DAGSTER_DEFAULT_ENV", "dev")
         url, token, _ = server._resolve_connection(None)
         assert url == "http://dev.dagster.io:3000/graphql"
         assert token == ""
 
     def test_multi_env_single_entry_auto_selected(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_ONE_ENV))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_ONE_ENV))
         monkeypatch.setattr(server, "_DAGSTER_DEFAULT_ENV", "")
         url, token, _ = server._resolve_connection(None)
         assert url == "https://stg.dagster.io/graphql"
         assert token == "stg-token"
 
     def test_multi_env_no_env_no_default_raises(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         monkeypatch.setattr(server, "_DAGSTER_DEFAULT_ENV", "")
         with pytest.raises(RuntimeError, match="no env specified"):
             server._resolve_connection(None)
 
     def test_multi_env_unknown_env_raises(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         with pytest.raises(RuntimeError, match="Unknown Dagster env 'nope'"):
             server._resolve_connection("nope")
 
     def test_trailing_slash_stripped(self, monkeypatch):
         monkeypatch.setattr(server, "_ENVS", {
-            "x": {"url": "https://example.com/dagster/"}
+            "x": server._EnvConfig(url="https://example.com/dagster/")
         })
         url, _, _ = server._resolve_connection("x")
         assert url == "https://example.com/dagster/graphql"
@@ -103,7 +126,7 @@ class TestGqlMultiEnv:
         return mock_post
 
     def test_gql_routes_to_correct_url_per_env(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         monkeypatch.setattr(server, "_DAGSTER_DEFAULT_ENV", "")
         mock_post = self._make_mock(monkeypatch, {"result": "ok"})
 
@@ -113,7 +136,7 @@ class TestGqlMultiEnv:
         assert call_url == "https://prod.dagster.io/graphql"
 
     def test_gql_sends_correct_token_per_env(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         monkeypatch.setattr(server, "_DAGSTER_DEFAULT_ENV", "prod")
         mock_post = self._make_mock(monkeypatch, {"result": "ok"})
 
@@ -123,13 +146,23 @@ class TestGqlMultiEnv:
         assert headers.get("Dagster-Cloud-Api-Token") == "prod-token"
 
     def test_gql_dev_env_no_token(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         mock_post = self._make_mock(monkeypatch, {"result": "ok"})
 
         gql("query { result }", env="dev")
 
         headers = mock_post.call_args.kwargs["headers"]
         assert "Dagster-Cloud-Api-Token" not in headers
+
+    def test_env_without_credentials_ignores_single_env_globals(self, monkeypatch):
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
+        monkeypatch.setattr(server, "DAGSTER_API_TOKEN", "global-token")
+        monkeypatch.setattr(server, "DAGSTER_EXTRA_HEADERS", '{"Authorization": "Bearer g"}')
+        mock_post = self._make_mock(monkeypatch, {"result": "ok"})
+
+        gql("query { result }", env="dev")
+
+        assert mock_post.call_args.kwargs["headers"] == {}
 
 
 class TestToolsWithEnvParam:
@@ -143,7 +176,7 @@ class TestToolsWithEnvParam:
         return mock_post
 
     def test_get_runs_passes_env_to_gql(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         mock_post = self._mock_post(monkeypatch, {"runsOrError": {"results": []}})
 
         get_runs(env="prod")
@@ -152,7 +185,7 @@ class TestToolsWithEnvParam:
         assert "prod.dagster.io" in call_url
 
     def test_list_jobs_passes_env_to_gql(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         mock_post = self._mock_post(
             monkeypatch,
             {
@@ -169,7 +202,7 @@ class TestToolsWithEnvParam:
         assert "dev.dagster.io" in call_url
 
     def test_get_instance_status_passes_env(self, monkeypatch):
-        monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
+        monkeypatch.setattr(server, "_ENVS", server._parse_dagster_envs(_TWO_ENVS))
         mock_post = self._mock_post(monkeypatch, {
             "instance": {"daemonHealth": {"allDaemonStatuses": []}},
             "runsOrError": {"results": []},
